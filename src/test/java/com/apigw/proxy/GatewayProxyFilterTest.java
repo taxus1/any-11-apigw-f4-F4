@@ -77,7 +77,9 @@ class GatewayProxyFilterTest {
                 catalog, new RouteMatcher(), new UpstreamForwarder(webClient),
                 new AccessLogRecorder(), e -> recordedEntries.add(e), new ObjectMapper(),
                 // 本测试不涉用户令牌：装一个「未启用」的守门人，验证老链路行为零变化
-                new com.apigw.proxy.userauth.UserAuthGatekeeper(null, null));
+                new com.apigw.proxy.userauth.UserAuthGatekeeper(null, null),
+                new com.apigw.proxy.gray.GrayReleaseSelector(
+                        new com.apigw.proxy.gray.GrayProperties(null)));
 
         // 链尾 WebHandler：到这里的只有被判定为非转发流量（/api），回一个占位 200
         WebHandler tail = exchange -> {
@@ -449,5 +451,122 @@ class GatewayProxyFilterTest {
         return recordedEntries.stream()
                 .filter(e -> e.requestId().equals(requestId))
                 .findFirst().orElseThrow();
+    }
+
+    // ---- 灰度发布（标记优先 + 按权重分流） ----
+
+    /** 起一个返回自定义标识的上游，响应体里写明自己是谁，调用方据此断言落到了哪一组。 */
+    private FakeUpstream labeledUpstream(String label) throws Exception {
+        FakeUpstream u = new FakeUpstream();
+        u.setCustomBody("{\"version\":\"" + label + "\"}");
+        return u;
+    }
+
+    private GatewayRoute grayRoute(String no, String mainUpstream,
+                                   com.apigw.domain.route.GrayGroup... groups) {
+        GatewayRoute r = GatewayRoute.create(no, no, mainUpstream, 1, null);
+        r.replaceRules(List.of(cond("PATH_PREFIX", null, "/g/", 1)), List.of());
+        r.replaceGrayGroups(List.of(groups));
+        return r;
+    }
+
+    private com.apigw.domain.route.GrayGroup group(String name, String baseUrl, int weight,
+                                                   String... tags) {
+        return com.apigw.domain.route.GrayGroup.create(name, baseUrl, weight,
+                tags.length == 0 ? List.of() : List.of(tags));
+    }
+
+    private String getGray(String tagHeader) {
+        var spec = client.get().uri(baseUrl + "/g/1");
+        if (tagHeader != null) {
+            spec.header("X-Gray-Tag", tagHeader);
+        }
+        return spec.retrieve().bodyToMono(String.class).block();
+    }
+
+    @Test
+    void gray_tagPinsToCanary_evenWithZeroWeight_wrongTagFallsToOld() throws Exception {
+        try (FakeUpstream oldUp = labeledUpstream("old");
+             FakeUpstream newUp = labeledUpstream("new")) {
+            // 新版一成量都没给（0），但带对标记的请求必须稳稳到新版；其余 100% 老版
+            loadRoutes(grayRoute("g", oldUp.baseUrl(),
+                    group("stable", oldUp.baseUrl(), 100),
+                    group("canary", newUp.baseUrl(), 0, "v2")));
+
+            assertThat(getGray("v2")).contains("\"version\":\"new\"");
+            // 大小写不一致 / 看着像对不上 → 一律当没带，落老版。
+            // 注：以空格开头/结尾的头值 HTTP 客户端在编解码层就发不出去（Netty 直接拒），
+            // 「多空格也当没带」这条由 GrayReleaseSelectorTest 用 mock 请求覆盖。
+            assertThat(getGray("V2")).contains("\"version\":\"old\"");
+            assertThat(getGray("v3")).contains("\"version\":\"old\"");
+            assertThat(getGray(null)).contains("\"version\":\"old\"");
+        }
+    }
+
+    @Test
+    void gray_weightSplit10_90_hitsBothUpstreamsInProportion() throws Exception {
+        try (FakeUpstream oldUp = labeledUpstream("old");
+             FakeUpstream newUp = labeledUpstream("new")) {
+            loadRoutes(grayRoute("g", oldUp.baseUrl(),
+                    group("stable", oldUp.baseUrl(), 90),
+                    group("canary", newUp.baseUrl(), 10)));
+
+            int toNew = 0;
+            for (int i = 0; i < 100; i++) {
+                if (getGray(null).contains("\"version\":\"new\"")) {
+                    toNew++;
+                }
+            }
+            assertThat(toNew).isEqualTo(10);
+            // 新版不是 0 个请求（「配了权重却分不到」不允许）
+            assertThat(newUp.lastExchange()).isNotNull();
+            assertThat(oldUp.lastExchange()).isNotNull();
+        }
+    }
+
+    @Test
+    void gray_extreme100to0_isStable_andTagStillReachesPaused() throws Exception {
+        try (FakeUpstream oldUp = labeledUpstream("old");
+             FakeUpstream newUp = labeledUpstream("new")) {
+            loadRoutes(grayRoute("g", oldUp.baseUrl(),
+                    group("stable", oldUp.baseUrl(), 100),
+                    group("paused", newUp.baseUrl(), 0, "internal")));
+
+            for (int i = 0; i < 20; i++) {
+                assertThat(getGray(null)).contains("\"version\":\"old\"");
+            }
+            assertThat(newUp.lastExchange()).as("0 权重组无标记时一个请求都收不到").isNull();
+            // 配置留着：标记直达，一键可开
+            assertThat(getGray("internal")).contains("\"version\":\"new\"");
+        }
+    }
+
+    @Test
+    void gray_weightChange_takesEffectImmediatelyViaChangeEvent() throws Exception {
+        try (FakeUpstream oldUp = labeledUpstream("old");
+             FakeUpstream newUp = labeledUpstream("new")) {
+            // 初始：老版全量
+            GatewayRoute v0 = grayRoute("g", oldUp.baseUrl(),
+                    group("stable", oldUp.baseUrl(), 100),
+                    group("canary", newUp.baseUrl(), 0, "v2"));
+            loadRoutes(v0);
+            assertThat(getGray(null)).contains("\"version\":\"old\"");
+
+            // 改配置（版本 +1）：对半分，事件即时生效，不重启、不等轮询
+            v0.setVersion(1);
+            v0.replaceGrayGroups(List.of(
+                    group("stable", oldUp.baseUrl(), 50),
+                    group("canary", newUp.baseUrl(), 50, "v2")));
+            store.setRoutes(List.of(v0));
+            catalog.onRoutesChanged(RoutesChangedEvent.updated("g"));
+
+            int toNew = 0;
+            for (int i = 0; i < 100; i++) {
+                if (getGray(null).contains("\"version\":\"new\"")) {
+                    toNew++;
+                }
+            }
+            assertThat(toNew).isEqualTo(50);
+        }
     }
 }

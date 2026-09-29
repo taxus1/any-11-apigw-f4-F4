@@ -45,7 +45,7 @@ class AccessLogRecorderTest {
         long before = System.currentTimeMillis();
         recorder.logIncoming(traceId, "GET", "/order/1");
         recorder.logOutcome(traceId, "GET", "/order/1", "order-route",
-                "http://order:8080", 200, "FORWARDED", 12);
+                "http://order:8080", 200, "FORWARDED", 12, null);
 
         await().untilAsserted(() -> assertThat(appender.list).hasSize(2));
         List<ILoggingEvent> events = appender.list;
@@ -65,8 +65,8 @@ class AccessLogRecorderTest {
     void twoRequests_doNotMixUpTheirTraceIds() {
         recorder.logIncoming("t1", "GET", "/a");
         recorder.logIncoming("t2", "GET", "/b");
-        recorder.logOutcome("t1", "GET", "/a", null, null, 404, "NO_ROUTE", 1);
-        recorder.logOutcome("t2", "GET", "/b", "r2", "http://h", 502, "UPSTREAM_UNAVAILABLE", 3);
+        recorder.logOutcome("t1", "GET", "/a", null, null, 404, "NO_ROUTE", 1, null);
+        recorder.logOutcome("t2", "GET", "/b", "r2", "http://h", 502, "UPSTREAM_UNAVAILABLE", 3, "v2");
 
         await().untilAsserted(() -> assertThat(appender.list).hasSize(4));
         String joined = appender.list.stream().map(ILoggingEvent::getFormattedMessage)

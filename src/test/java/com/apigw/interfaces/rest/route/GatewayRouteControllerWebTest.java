@@ -276,4 +276,120 @@ class GatewayRouteControllerWebTest {
         web.get().uri("/api/gateway/routes?keyword=分页").exchange().expectBody()
                 .jsonPath("$.data.total").isEqualTo(6);
     }
+
+    // ---- 灰度分组配置在入域时校验（碰 Redis 之前就拦住） ----
+
+    private Map<String, Object> group(String name, String upstream, Object weight,
+                                      List<String> tags) {
+        var m = new java.util.HashMap<String, Object>();
+        m.put("groupName", name);
+        m.put("upstream", upstream);
+        m.put("weight", weight);
+        if (tags != null) {
+            m.put("tags", tags);
+        }
+        return m;
+    }
+
+    private Map<String, Object> bodyWithGray(String routeNo, List<Map<String, Object>> groups) {
+        var m = body(routeNo, "灰度路由", "http://stable:8080", null,
+                List.of(rule("PATH_PREFIX", null, "/g/", 1)), List.of());
+        m.put("grayGroups", groups);
+        return m;
+    }
+
+    @Test
+    void create_validGrayGroups_returnsThemInDetail() {
+        when(store.create(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGray("gray-01", List.of(
+                        group("stable", "http://stable:8080", 90, List.of()),
+                        group("canary", "http://canary:8080", 10, List.of("v2")))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.grayGroups.length()").isEqualTo(2)
+                .jsonPath("$.data.grayGroups[1].groupName").isEqualTo("canary")
+                .jsonPath("$.data.grayGroups[1].weight").isEqualTo(10)
+                .jsonPath("$.data.grayGroups[1].tags[0]").isEqualTo("v2");
+    }
+
+    @Test
+    void create_zeroWeightIsAllowed_configStays() {
+        when(store.create(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGray("gray-02", List.of(
+                        group("stable", "http://stable:8080", 100, null),
+                        group("canary", "http://canary:8080", 0, List.of("v2")))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.grayGroups[1].weight").isEqualTo(0);
+    }
+
+    @Test
+    void create_weightsNotSumming100_rejectedWithBreakdown() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGray("gray-03", List.of(
+                        group("stable", "http://stable:8080", 90, null),
+                        group("canary", "http://canary:8080", 5, List.of("v2")))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString())
+                                .contains("权重之和必须恰好为 100")
+                                .contains("stable=90").contains("canary=5"));
+    }
+
+    @Test
+    void create_negativeWeight_rejected() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGray("gray-04", List.of(
+                        group("stable", "http://stable:8080", 110, null),
+                        group("canary", "http://canary:8080", -10, null))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString())
+                                .contains("权重超出范围"));
+    }
+
+    @Test
+    void create_weightNotANumber_rejectedAsBadRequestShape() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGray("gray-05", List.of(
+                        group("stable", "http://stable:8080", "一成", null),
+                        group("canary", "http://canary:8080", 90, null))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString())
+                                .contains("权重必须是整数"));
+    }
+
+    @Test
+    void create_duplicateTagAcrossGroups_rejected() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGray("gray-06", List.of(
+                        group("a", "http://a:8080", 50, List.of("v2")),
+                        group("b", "http://b:8080", 50, List.of("v2")))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString())
+                                .contains("灰度标记值 v2 同时挂在分组 a 与分组 b"));
+    }
+
+    @Test
+    void create_garbageGroupUpstream_rejected() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGray("gray-07", List.of(
+                        group("stable", "http://stable:8080", 90, null),
+                        group("canary", "not-a-url", 10, null))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString())
+                                .contains("灰度分组第 2 条的上游地址"));
+    }
 }

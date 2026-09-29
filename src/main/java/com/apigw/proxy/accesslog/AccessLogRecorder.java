@@ -60,14 +60,17 @@ public class AccessLogRecorder {
      *
      * @param outcome FORWARDED / NO_ROUTE / UPSTREAM_UNAVAILABLE / UPSTREAM_TIMEOUT / CONFIG_UNAVAILABLE / ABORTED
      * @param elapsedMillis 从请求进来到响应出去的总耗时（毫秒）
+     * @param grayGroup 命中的灰度分组名；没做灰度为 null（日志里记 "-"）
      */
     public void logOutcome(String traceId, String method, String path, String routeNo,
-                           String upstream, int status, String outcome, long elapsedMillis) {
+                           String upstream, int status, String outcome, long elapsedMillis,
+                           String grayGroup) {
         String route = routeNo == null ? "-" : routeNo;
         String up = upstream == null ? "-" : upstream;
+        String group = grayGroup == null ? "-" : grayGroup;
         enqueue(() -> access.info(
-                "phase=OUT traceId={} method={} path={} route={} upstream={} status={} outcome={} elapsed={}ms",
-                traceId, method, path, route, up, status, outcome, elapsedMillis));
+                "phase=OUT traceId={} method={} path={} route={} upstream={} status={} outcome={} grayGroup={} elapsed={}ms",
+                traceId, method, path, route, up, status, outcome, group, elapsedMillis));
     }
 
     private void enqueue(Runnable task) {

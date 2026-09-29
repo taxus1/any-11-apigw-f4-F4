@@ -2,11 +2,13 @@ package com.apigw.common.exception;
 
 import com.apigw.common.Result;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.codec.DecodingException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.bind.support.WebExchangeBindException;
 import org.springframework.web.server.MissingRequestValueException;
+import org.springframework.web.server.ServerWebInputException;
 import reactor.core.publisher.Mono;
 
 /**
@@ -40,6 +42,17 @@ public class GlobalExceptionHandler {
         String name = e.getReason() != null ? e.getReason() : "必填参数";
         log.warn("缺少请求参数：{}", name);
         return Mono.just(Result.fail("缺少必填参数：" + name));
+    }
+
+    /**
+     * 请求体解析不了（JSON 格式错、字段类型对不上，例如权重 weight 传成 "一成"/"10.5"）：
+     * 这是调用方入参问题，收口成 400 式业务失败，别按系统异常回 500，更别把 Jackson 细节透出去。
+     */
+    @ExceptionHandler(ServerWebInputException.class)
+    public Mono<Result<Void>> handleUnreadableRequest(ServerWebInputException e) {
+        String hint = e.getCause() instanceof DecodingException ? "（请检查字段类型，例如权重必须是整数）" : "";
+        log.warn("请求体无法解析：{}", e.getMessage());
+        return Mono.just(Result.fail("请求体格式或字段类型不正确" + hint));
     }
 
     @ExceptionHandler(Exception.class)

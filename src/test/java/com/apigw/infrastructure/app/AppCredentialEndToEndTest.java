@@ -133,8 +133,11 @@ class AppCredentialEndToEndTest {
         assertThat(call("/order/1", "e2e-1", "wrong-secret-0000000000000000000", null).status())
                 .isEqualTo(401);
 
-        // 3. 配上名单：旧来源立刻 403，名单内来源立刻 200（无需重启/无宽限）
+        // 3. 配上名单：旧来源立刻 403，名单内来源立刻 200（无需重启/无宽限）。
+        //    生产里事件监听是 refresh().subscribe() 异步刷新，这里先把这一拍刷新等完，
+        //    模拟「事件已被监听处理完」，避免测试用 HTTP 请求去跟刷新线程赛跑（偶发 200 的竞态）
         service.addOrigin("e2e-1", "203.0.113.1");
+        catalog.refreshBlock(Duration.ofSeconds(5));
         Resp oldIp = call("/order/1", "e2e-1", secret, "198.51.100.9");
         assertThat(oldIp.status()).isEqualTo(403);
         assertThat(oldIp.error()).isEqualTo("APP_FORBIDDEN");
@@ -146,18 +149,21 @@ class AppCredentialEndToEndTest {
         // 4. 停用：同一把凭据立刻失效；重复停用幂等
         service.disable("e2e-1");
         service.disable("e2e-1");
+        catalog.refreshBlock(Duration.ofSeconds(5));
         Resp disabled = call("/order/1", "e2e-1", secret, "203.0.113.1");
         assertThat(disabled.status()).isEqualTo(403);
 
         // 5. 再启用恢复
         service.enable("e2e-1");
         service.enable("e2e-1");
+        catalog.refreshBlock(Duration.ofSeconds(5));
         assertThat(call("/order/1", "e2e-1", secret, "203.0.113.1").status()).isEqualTo(200);
 
         // 6. 来路名单接口读出与落库一致（规范化存储）
         assertThat(service.listOrigins("e2e-1")).containsExactly("203.0.113.1");
         // 删除唯一一条后立即恢复「不限」
         service.removeOrigin("e2e-1", "203.0.113.1");
+        catalog.refreshBlock(Duration.ofSeconds(5));
         assertThat(call("/order/1", "e2e-1", secret, "198.51.100.9").status()).isEqualTo(200);
 
         // 7. 详情/列表都不泄露密钥

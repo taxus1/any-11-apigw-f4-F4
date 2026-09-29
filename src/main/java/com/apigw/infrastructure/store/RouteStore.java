@@ -2,6 +2,7 @@ package com.apigw.infrastructure.store;
 
 import com.apigw.common.exception.BizException;
 import com.apigw.domain.route.GatewayRoute;
+import com.apigw.domain.route.GrayGroup;
 import com.apigw.domain.route.GatewayRule;
 import com.apigw.domain.route.RuleTypes;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -100,8 +101,11 @@ public class RouteStore {
     public Mono<GatewayRoute> update(GatewayRoute route) {
         Integer expectVersion = route.getVersion();
         if (expectVersion == null) {
-            // 不允许「不带版本就改」，否则等于把乐观锁绕过去，静默覆盖别人的修改
-            throw new BizException("修改必须带上读取时拿到的版本号 version（首版也要显式传 0），用于并发冲突检测");
+            // 不允许「不带版本就改」，否则等于把乐观锁绕过去，静默覆盖别人的修改。
+            // 错误经 Mono 发出而非同步抛出：这是响应式契约，调用方的 onErrorResume 才接得住，
+            // 反应式链路上也不会突然冒一个同步异常出来
+            return Mono.error(new BizException(
+                    "修改必须带上读取时拿到的版本号 version（首版也要显式传 0），用于并发冲突检测"));
         }
         return withLock(route.getRouteNo(), () ->
                 findByRouteNo(route.getRouteNo())
@@ -217,6 +221,8 @@ public class RouteStore {
         public Integer version;
         public List<RuleDto> conditions = new ArrayList<>();
         public List<RuleDto> actions = new ArrayList<>();
+        /** 灰度分组：旧配置 JSON 没这个字段时为 null，toDomain 按「无灰度」落，向后兼容。 */
+        public List<GrayGroupDto> grayGroups;
 
         static Dto from(GatewayRoute r) {
             Dto d = new Dto();
@@ -230,6 +236,8 @@ public class RouteStore {
             d.version = r.getVersion();
             d.conditions = r.getConditions().stream().map(RuleDto::from).toList();
             d.actions = r.getActions().stream().map(RuleDto::from).toList();
+            d.grayGroups = r.getGrayGroups() == null ? List.of()
+                    : r.getGrayGroups().stream().map(GrayGroupDto::from).toList();
             return d;
         }
 
@@ -242,6 +250,10 @@ public class RouteStore {
             r.replaceRules(
                     conditions == null ? List.of() : conditions.stream().map(RuleDto::toDomain).toList(),
                     actions == null ? List.of() : actions.stream().map(RuleDto::toDomain).toList());
+            // 灰度分组整体走聚合校验（权重和=100、组名/标记唯一、上游合法）；
+            // 旧 JSON 缺字段（null）= 无灰度，全量流量回主上游
+            r.replaceGrayGroups(
+                    grayGroups == null ? List.of() : grayGroups.stream().map(GrayGroupDto::toDomain).toList());
             r.getConditions().forEach(x -> x.setRuleKind(RuleTypes.KIND_CONDITION));
             r.getActions().forEach(x -> x.setRuleKind(RuleTypes.KIND_ACTION));
             return r;
@@ -270,6 +282,28 @@ public class RouteStore {
 
         GatewayRule toDomain() {
             return GatewayRule.create(stage, type, name, value, sortNo);
+        }
+    }
+
+    /** 灰度分组在 Redis 里的形状：组名/上游/权重/标记值原样存取，校验在聚合层。 */
+    public static class GrayGroupDto {
+        public String groupName;
+        public String upstream;
+        public Integer weight;
+        public List<String> tags;
+
+        static GrayGroupDto from(GrayGroup g) {
+            GrayGroupDto d = new GrayGroupDto();
+            d.groupName = g.getGroupName();
+            d.upstream = g.getUpstream();
+            d.weight = g.getWeight();
+            d.tags = g.getTags() == null ? List.of() : new ArrayList<>(g.getTags());
+            return d;
+        }
+
+        GrayGroup toDomain() {
+            return GrayGroup.create(groupName, upstream, weight,
+                    tags == null ? List.of() : new ArrayList<>(tags));
         }
     }
 

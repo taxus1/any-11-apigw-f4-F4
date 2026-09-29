@@ -4,13 +4,12 @@ import com.apigw.common.exception.BizException;
 import lombok.Getter;
 import lombok.Setter;
 
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Pattern;
+import java.util.Set;
 
 /**
  * 聚合根：一条网关路由，连同它的全部匹配条件与转发动作。
@@ -21,17 +20,15 @@ import java.util.regex.Pattern;
  *    空串、纯主机名、一串乱码一律不收；
  * 3. enabled 只认 0 / 1；
  * 4. 同一组的子项顺序号必须从 1 起、连续、不重，撞号要报出是哪两条撞的；
- * 5. 类型/方向/必填项由 {@link GatewayRule#validateAs} 守住。
+ * 5. 类型/方向/必填项由 {@link GatewayRule#validateAs} 守住；
+ * 6. 灰度分组见 {@link #replaceGrayGroups}：组名/标记值路由内唯一，
+ *    权重必须是 0~100 整数且各组之和恰好为 100，也不允许全 0。
  *
  * version 承载乐观锁语义：并发保存同一条路由时，旧版本提交会被拒。
  */
 @Getter
 @Setter
 public class GatewayRoute {
-
-    /** 主机名/IP（允许下划线，内网服务名常用）+ 可选端口；也兼容 [IPv6]。 */
-    private static final Pattern HOST_PORT = Pattern.compile(
-            "^(?:[A-Za-z0-9._-]+|\\[[0-9A-Fa-f:]+])(?::([0-9]{1,5}))?$");
 
     private String id;
 
@@ -63,6 +60,13 @@ public class GatewayRoute {
     /** 转发动作（stage 可为 REQUEST 或 RESPONSE）。 */
     private List<GatewayRule> actions = new ArrayList<>();
 
+    /**
+     * 灰度分组：为空（null 或空列表）表示这条路由不做灰度，所有请求都打主上游 {@link #upstream}；
+     * 非空时请求在这些组之间分流（标记精确命中优先，其余按权重平滑轮询），
+     * 主上游仅作为「一条灰度组都没配」时的目标，不再接灰度流量。
+     */
+    private List<GrayGroup> grayGroups = new ArrayList<>();
+
     public static GatewayRoute create(String routeNo, String name, String upstream,
                                       Integer enabled, String remark) {
         GatewayRoute route = new GatewayRoute();
@@ -76,6 +80,7 @@ public class GatewayRoute {
         route.setVersion(0);
         route.setConditions(new ArrayList<>());
         route.setActions(new ArrayList<>());
+        route.setGrayGroups(new ArrayList<>());
         return route;
     }
 
@@ -137,41 +142,10 @@ public class GatewayRoute {
     /**
      * 改上游：必须是一个合法的 http/https URL。
      * 只看前缀挡不住 "http://"、"http://一串乱码"，所以这里按 URI 真正解析一遍，
-     * 再确认主机名/端口像样。
+     * 再确认主机名/端口像样。灰度分组的上游走同一套校验（{@link UpstreamValidator}）。
      */
     public void changeUpstream(String upstream) {
-        if (upstream == null || upstream.isBlank()) {
-            throw new BizException("上游地址不能为空");
-        }
-        String v = upstream.trim();
-        URI uri;
-        try {
-            uri = new URI(v);
-        } catch (URISyntaxException e) {
-            throw new BizException("上游地址不是合法的 URL：" + v);
-        }
-        String scheme = uri.getScheme();
-        if (scheme == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
-            throw new BizException("上游地址必须以 http:// 或 https:// 开头");
-        }
-        // 去掉 userinfo@，只看 host:port 这段
-        String hostPort = uri.getRawAuthority() == null ? "" : uri.getRawAuthority();
-        int at = hostPort.lastIndexOf('@');
-        if (at >= 0) {
-            hostPort = hostPort.substring(at + 1);
-        }
-        var m = HOST_PORT.matcher(hostPort);
-        if (!m.matches()) {
-            throw new BizException("上游地址里的主机:端口不合法：" + hostPort
-                    + "（示例 http://order-svc:8080）");
-        }
-        if (m.group(1) != null) {
-            int port = Integer.parseInt(m.group(1));
-            if (port < 1 || port > 65535) {
-                throw new BizException("上游地址端口必须在 1~65535 之间：" + port);
-            }
-        }
-        this.upstream = v;
+        this.upstream = UpstreamValidator.requireValid(upstream, "上游地址");
     }
 
     /**
@@ -216,5 +190,53 @@ public class GatewayRoute {
                         + "（现在有 " + rules.size() + " 条）");
             }
         }
+    }
+
+    /**
+     * 整组替换灰度分组（与条件/动作一样是「整树替换」语义）。
+     *
+     * 传 null / 空列表 = 这条路由不做灰度，全部流量回主上游 {@link #upstream}（向后兼容旧配置）。
+     * 非空时按「先逐组、再整组」两步校验：
+     * - 逐组：组名格式与路由内唯一、上游地址合法、权重为 0~100 整数、
+     *   标记值合法且一个标记不能同时挂两组（细节见 {@link GrayGroup#validate}）；
+     * - 整组：权重之和必须<b>恰好</b>为 100，报错时把每组权重都列出来，
+     *   不用运营自己去猜是哪几组配错；和为 100 自然排除了「全组 0 权重」。
+     *
+     * 0 权重合法：该组先不接比例流量，但配置保留（标记仍可精确命中），回头把权重一改即可放量。
+     */
+    public void replaceGrayGroups(List<GrayGroup> newGroups) {
+        if (newGroups == null || newGroups.isEmpty()) {
+            this.grayGroups = new ArrayList<>();
+            return;
+        }
+        List<GrayGroup> gs = new ArrayList<>(newGroups);
+        Set<String> seenNames = new HashSet<>();
+        Map<String, String> tagOwner = new HashMap<>();
+        int total = 0;
+        for (int i = 0; i < gs.size(); i++) {
+            GrayGroup g = gs.get(i);
+            if (g == null) {
+                throw new BizException("灰度分组第 " + (i + 1) + " 条为空");
+            }
+            g.validate(i + 1, seenNames, tagOwner);
+            total += g.getWeight();
+        }
+        if (total != 100) {
+            StringBuilder detail = new StringBuilder();
+            for (GrayGroup g : gs) {
+                if (detail.length() > 0) {
+                    detail.append("，");
+                }
+                detail.append(g.getGroupName()).append('=').append(g.getWeight());
+            }
+            throw new BizException("灰度分组的权重之和必须恰好为 100，现在合计是 " + total
+                    + "（" + detail + "），请检查是哪几组配错了；想临时关某组把它配成 0 即可，别靠凑和之外的方式留组");
+        }
+        this.grayGroups = gs;
+    }
+
+    /** 是否配了灰度分组；没配时所有请求都打主上游，灰度逻辑完全不介入。 */
+    public boolean hasGrayGroups() {
+        return grayGroups != null && !grayGroups.isEmpty();
     }
 }

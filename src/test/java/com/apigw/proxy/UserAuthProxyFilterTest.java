@@ -85,7 +85,9 @@ class UserAuthProxyFilterTest {
                 .build();
         var filter = new GatewayProxyWebFilter(
                 catalog, new RouteMatcher(), new UpstreamForwarder(webClient),
-                new AccessLogRecorder(), e -> { }, new ObjectMapper(), gatekeeper);
+                new AccessLogRecorder(), e -> { }, new ObjectMapper(), gatekeeper,
+                new com.apigw.proxy.gray.GrayReleaseSelector(
+                        new com.apigw.proxy.gray.GrayProperties(null)));
         WebHandler tail = exchange -> {
             exchange.getResponse().setStatusCode(HttpStatus.OK);
             return exchange.getResponse().setComplete();

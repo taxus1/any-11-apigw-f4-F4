@@ -4,6 +4,7 @@ import com.apigw.application.route.GatewayRouteAppService;
 import com.apigw.common.Result;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
+import com.apigw.domain.route.GrayGroup;
 import com.apigw.infrastructure.store.dto.PageResult;
 import com.apigw.infrastructure.store.dto.RouteView;
 import com.apigw.interfaces.rest.route.vo.RouteDetailVO;
@@ -89,11 +90,18 @@ public class GatewayRouteController {
                 : body.conditions().stream().map(GatewayRouteController::toRule).toList();
         List<GatewayRule> actions = body.actions() == null ? List.of()
                 : body.actions().stream().map(GatewayRouteController::toRule).toList();
+        List<GrayGroup> groups = body.grayGroups() == null ? List.of()
+                : body.grayGroups().stream().map(GatewayRouteController::toGrayGroup).toList();
         return appService.assemble(body.routeNo(), body.name(), body.upstream(),
-                body.enabled(), body.authRequired(), body.remark(), body.version(), conditions, actions);
+                body.enabled(), body.authRequired(), body.remark(), body.version(),
+                conditions, actions, groups);
     }
 
     private static GatewayRule toRule(RouteSaveVO.RuleVO vo) {
         return GatewayRule.create(vo.stage(), vo.type(), vo.name(), vo.value(), vo.sortNo());
+    }
+
+    private static GrayGroup toGrayGroup(RouteSaveVO.GrayGroupVO vo) {
+        return GrayGroup.create(vo.groupName(), vo.upstream(), vo.weight(), vo.tags());
     }
 }

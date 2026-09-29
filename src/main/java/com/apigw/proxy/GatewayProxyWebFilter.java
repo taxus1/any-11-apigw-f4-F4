@@ -12,6 +12,8 @@ import com.apigw.proxy.error.GatewayErrors;
 import com.apigw.proxy.error.UpstreamFailureKind;
 import com.apigw.proxy.forward.UpstreamForwarder;
 import com.apigw.proxy.forward.UpstreamResponse;
+import com.apigw.proxy.gray.GrayReleaseSelector;
+import com.apigw.proxy.gray.GrayTarget;
 import com.apigw.proxy.match.RouteMatcher;
 import com.apigw.proxy.route.RouteCatalog;
 import com.apigw.proxy.userauth.OutboundAuth;
@@ -82,6 +84,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
     private final AccessLogSink accessLogSink;
     private final ObjectMapper objectMapper;
     private final UserAuthGatekeeper userAuth;
+    private final GrayReleaseSelector graySelector;
 
     public GatewayProxyWebFilter(RouteCatalog routeCatalog,
                                  RouteMatcher routeMatcher,
@@ -89,7 +92,8 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                                  AccessLogRecorder accessLog,
                                  AccessLogSink accessLogSink,
                                  ObjectMapper objectMapper,
-                                 UserAuthGatekeeper userAuth) {
+                                 UserAuthGatekeeper userAuth,
+                                 GrayReleaseSelector graySelector) {
         this.routeCatalog = routeCatalog;
         this.routeMatcher = routeMatcher;
         this.forwarder = forwarder;
@@ -97,6 +101,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
         this.accessLogSink = accessLogSink;
         this.objectMapper = objectMapper;
         this.userAuth = userAuth;
+        this.graySelector = graySelector;
     }
 
     @Override
@@ -179,9 +184,17 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                         identity = userAuth.tryVerifyIdentity(exchange.getRequest());
                     }
 
-                    outcome.set(new Outcome(route.getRouteNo(), route.getUpstream(), "FORWARDED"));
+                    // 灰度分流：配了灰度分组才介入（null = 走主上游，旧链路零变化）。
+                    // 标记精确命中优先，且永远赢权重——哪怕目标组权重是 0；
+                    // 没带/带错标记才在 weight>0 的组间平滑加权轮询。
+                    GrayTarget grayTarget = graySelector.select(route, exchange.getRequest());
+                    String targetUpstream = grayTarget != null
+                            ? grayTarget.upstream() : route.getUpstream();
+                    String groupName = grayTarget != null ? grayTarget.groupName() : null;
+
+                    outcome.set(new Outcome(route.getRouteNo(), targetUpstream, "FORWARDED", groupName));
                     URI targetUri = UpstreamForwarder.resolveTargetUri(
-                            route.getUpstream(), exchange.getRequest());
+                            targetUpstream, exchange.getRequest());
                     OutboundAuth outboundAuth = userAuth.outbound(
                             traceId, exchange.getRequest(), identity);
                     // 响应处理必须在 WebClient 的 exchangeToMono 回调内完成（此时仍持有上游连接），
@@ -191,8 +204,8 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                             upstream -> writeUpstreamResponse(exchange, route, upstream))
                             .onErrorResume(err -> {
                                 UpstreamFailureKind kind = UpstreamFailureKind.classify(err);
-                                outcome.set(new Outcome(route.getRouteNo(), route.getUpstream(),
-                                        kind.errorCode()));
+                                outcome.set(new Outcome(route.getRouteNo(), targetUpstream,
+                                        kind.errorCode(), groupName));
                                 return fail(exchange, traceId, kind, err);
                             });
                 })
@@ -211,7 +224,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                             ? 0 : exchange.getResponse().getStatusCode().value();
                     long elapsed = elapsedMillis(startNanos);
                     accessLog.logOutcome(traceId, method, path, o.routeNo(), o.upstream(),
-                            status, o.result(), elapsed);
+                            status, o.result(), elapsed, o.group());
 
                     // 同一持有者补齐第二段 → 完整一行异步入库（只做一次非阻塞入队，不卡响应）
                     safeRecord(accessEntry.complete(o.routeNo(), status, elapsed));
@@ -302,7 +315,10 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
         return (System.nanoTime() - startNanos) / 1_000_000;
     }
 
-    /** 一次转发在审计日志里的归宿：命中路由、上游地址、结果码。 */
-    private record Outcome(String routeNo, String upstream, String result) {
+    /** 一次转发在审计日志里的归宿：命中路由、上游地址、结果码、灰度组（无灰度为 null）。 */
+    private record Outcome(String routeNo, String upstream, String result, String group) {
+        Outcome(String routeNo, String upstream, String result) {
+            this(routeNo, upstream, result, null);
+        }
     }
 }

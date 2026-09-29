@@ -33,6 +33,10 @@ apigw:
     route-refresh-interval: 10s
     # 兜底轮询周期（毫秒），与上面的 Duration 保持一致；@Scheduled 只吃 long/字符串
     route-refresh-interval-ms: 10000
+    # 灰度标记请求头：值大小写敏感、精确匹配（多空格/大小写不一致一律当没带，回落按权重分）。
+    # 默认 X-Gray-Tag，可经环境变量改；标记优先级永远高于权重，详见 README「灰度发布」。
+    gray:
+      tag-header: ${GRAY_TAG_HEADER:X-Gray-Tag}
   # 访问流水落库。本地默认关闭（无库也能起网关、跑转发）；生产置 true 并给数据源。
   # 攒批边界：500 条一批、最多等 2s 落一次；入口队列 2 万，满则丢日志计数、绝不反压转发；
   # 正常退出最多等 10s 把手里批次 flush 完。
