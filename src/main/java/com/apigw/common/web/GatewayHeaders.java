@@ -41,6 +41,20 @@ public final class GatewayHeaders {
     /** 网关盖的通行标记（出站）：上游据此确认这笔请求确实过了网关。 */
     public static final String GATEWAY_PASS_HEADER = "X-Gateway-Pass";
 
+    /**
+     * 灰度标记头（<b>入站</b>）：调用方带它指定要走哪一个灰度分组。
+     * 头名是写死的一个，不认调用方自定义的名字；头值必须与某组配的 grayTag
+     * <b>原样精确相等</b>（大小写、首尾空格都敏感，网关不做 trim/大小写归一），
+     * 没带、带空值或值对不上任何一组，一律当没带，落回按权重散流。
+     */
+    public static final String GRAY_TAG_HEADER = "X-Gray-Tag";
+
+    /**
+     * 灰度分组回显头（<b>出站响应</b>）：这笔请求最终落到了哪个分组，网关在响应头里写明，
+     * 方便灰度核对与排障（看一眼就知道是标记命中还是权重散到的）。
+     */
+    public static final String GRAY_GROUP_HEADER = "X-Gray-Group";
+
     /** 追踪号：字母数字与 . _ -，长度 8..64（覆盖常见 trace/span 号与 UUID）。 */
     private static final Pattern TRACE_ID_PATTERN = Pattern.compile("[A-Za-z0-9._-]{8,64}");
 

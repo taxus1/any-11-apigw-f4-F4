@@ -3,6 +3,7 @@ package com.apigw.application.route;
 import com.apigw.common.exception.BizException;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
+import com.apigw.domain.route.RouteGroup;
 import com.apigw.infrastructure.store.RouteStore;
 import com.apigw.infrastructure.store.dto.PageResult;
 import com.apigw.infrastructure.store.dto.RouteView;
@@ -106,14 +107,28 @@ public class GatewayRouteAppService {
                 || (r.getName() != null && r.getName().toLowerCase(Locale.ROOT).contains(lower));
     }
 
-    /** 把一份外部输入整理成聚合（聚合的全部校验在这里同步完成）。 */
+    /**
+     * 把一份外部输入整理成聚合（聚合的全部校验在这里同步完成）。
+     *
+     * 灰度分组二选一给法：
+     * - 显式给 groups（一组或多组）：组间规则（编号/标记不重、权重和 100、地址合法）在聚合里守，
+     *   顶层 upstream 可以不给；
+     * - 没给 groups：沿用老口径，必须给顶层 upstream，聚合自动补成一个权重 100 的默认单组。
+     */
     public GatewayRoute assemble(String routeNo, String name, String upstream, Integer enabled,
                                  Integer authRequired, String remark, Integer version,
-                                 List<GatewayRule> conditions, List<GatewayRule> actions) {
+                                 List<GatewayRule> conditions, List<GatewayRule> actions,
+                                 List<RouteGroup> groups) {
         GatewayRoute route = GatewayRoute.create(routeNo, name, upstream, enabled, remark);
         route.changeAuthRequired(authRequired);
         // version 原样带入：修改时必须等于当前版本；为空会在 store 被拒
         route.setVersion(version);
+        if (groups != null && !groups.isEmpty()) {
+            route.replaceGroups(groups);
+        } else if (upstream == null || upstream.isBlank()) {
+            // 分组和顶层上游都没给：没有任何可转发地址，直接拦，别存一份谁都解释不了的路由
+            throw new BizException("上游地址不能为空：要么直接给 upstream（单上游），要么配灰度分组 groups");
+        }
         route.replaceRules(conditions, actions);
         return route;
     }

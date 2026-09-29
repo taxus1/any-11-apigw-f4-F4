@@ -20,7 +20,8 @@ public record RouteView(String id,
                         String remark,
                         Integer version,
                         int conditionCount,
-                        int actionCount) implements Serializable {
+                        int actionCount,
+                        int groupCount) implements Serializable {
 
     public static RouteView of(GatewayRoute r) {
         return new RouteView(
@@ -33,6 +34,7 @@ public record RouteView(String id,
                 r.getRemark(),
                 r.getVersion(),
                 r.getConditions() == null ? 0 : r.getConditions().size(),
-                r.getActions() == null ? 0 : r.getActions().size());
+                r.getActions() == null ? 0 : r.getActions().size(),
+                r.getGroups() == null ? 0 : r.getGroups().size());
     }
 }

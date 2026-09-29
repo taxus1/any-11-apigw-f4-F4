@@ -5,18 +5,20 @@ import com.apigw.common.web.GatewayHeaders;
 import com.apigw.domain.accesslog.AccessLogEntry;
 import com.apigw.domain.accesslog.AccessLogSink;
 import com.apigw.domain.route.GatewayRoute;
+import com.apigw.domain.route.RouteGroup;
 import com.apigw.domain.userauth.UserIdentity;
+import com.apigw.domain.userauth.UserTokenVerifier;
 import com.apigw.proxy.accesslog.AccessLogRecorder;
 import com.apigw.proxy.action.HeaderActionApplier;
 import com.apigw.proxy.error.GatewayErrors;
 import com.apigw.proxy.error.UpstreamFailureKind;
 import com.apigw.proxy.forward.UpstreamForwarder;
 import com.apigw.proxy.forward.UpstreamResponse;
+import com.apigw.proxy.gray.GrayRoutingTable;
 import com.apigw.proxy.match.RouteMatcher;
 import com.apigw.proxy.route.RouteCatalog;
 import com.apigw.proxy.userauth.OutboundAuth;
 import com.apigw.proxy.userauth.UserAuthGatekeeper;
-import com.apigw.domain.userauth.UserTokenVerifier;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.Ordered;
@@ -137,14 +139,23 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
         exchange.getResponse().getHeaders().set(GatewayErrors.TRACE_HEADER, traceId);
         accessLog.logIncoming(traceId, method, path);
 
-        return routeCatalog.routes()
-                .flatMap(routes -> {
-                    GatewayRoute route = routeMatcher.match(routes, exchange.getRequest());
+        return routeCatalog.snapshot()
+                .flatMap(snap -> {
+                    GatewayRoute route = routeMatcher.match(snap.routes(), exchange.getRequest());
                     if (route == null) {
                         outcome.set(new Outcome(null, null, "NO_ROUTE"));
                         return GatewayErrors.write(exchange, objectMapper,
                                 UpstreamFailureKind.NO_ROUTE, traceId, null);
                     }
+
+                    // 灰度选组：先标记后权重。带合法 X-Gray-Tag 稳稳落到点名的那组（与权重无关，
+                    // 哪怕它权重 0、或老版本压着 100）；没带/值不对在权重>0 的组里平滑加权散流。
+                    // 选组在鉴权之前：401 也要能在响应头/流水里说清「本来要去哪组」。
+                    GrayRoutingTable.Selection selection =
+                            snap.grayTable().select(route, exchange.getRequest());
+                    RouteGroup group = selection.group();
+                    exchange.getResponse().getHeaders()
+                            .set(GatewayHeaders.GRAY_GROUP_HEADER, group.getGroupNo());
 
                     // 登录鉴权（标记跟着路由走，一条一配）。开放路由与受保护路由走同一套链路：
                     // - 受保护路由：必须带一张验得过的令牌（签名真/没过期/信息全），任何一样不过都 401；
@@ -156,7 +167,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                             // 配了「需登录」却没配验签密钥：配置事故，fail-closed，绝不裸放行
                             log.warn("路由 {} 要求登录，但未配置用户令牌验签密钥 traceId={}",
                                     route.getRouteNo(), traceId);
-                            outcome.set(new Outcome(route.getRouteNo(), route.getUpstream(),
+                            outcome.set(new Outcome(route.getRouteNo(), group.getUpstream(),
                                     UpstreamFailureKind.USER_AUTH_CONFIG_UNAVAILABLE.errorCode()));
                             return GatewayErrors.write(exchange, objectMapper,
                                     UpstreamFailureKind.USER_AUTH_CONFIG_UNAVAILABLE, traceId, null);
@@ -165,25 +176,28 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                         if (token == null) {
                             log.debug("登录鉴权拒绝 reason=MISSING_TOKEN route={} traceId={}",
                                     route.getRouteNo(), traceId);
-                            return rejectUserUnauthorized(exchange, route, traceId, outcome);
+                            return rejectUserUnauthorized(exchange, route, group, traceId, outcome);
                         }
                         UserTokenVerifier.Result checked = userAuth.verify(token);
                         if (!checked.ok()) {
                             // 具体原因（签名错/过期/声明不全）只在服务端日志，不回给调用方
                             log.debug("登录鉴权拒绝 reason={} route={} traceId={}",
                                     checked.failure(), route.getRouteNo(), traceId);
-                            return rejectUserUnauthorized(exchange, route, traceId, outcome);
+                            return rejectUserUnauthorized(exchange, route, group, traceId, outcome);
                         }
                         identity = checked.identity();
                     } else {
                         identity = userAuth.tryVerifyIdentity(exchange.getRequest());
                     }
 
-                    outcome.set(new Outcome(route.getRouteNo(), route.getUpstream(), "FORWARDED"));
+                    outcome.set(new Outcome(route.getRouteNo(), group.getUpstream(), "FORWARDED"));
+                    // 转发地址取选中分组的上游（顶层 upstream 只是基线组镜像，这里必须以分组为准）
                     URI targetUri = UpstreamForwarder.resolveTargetUri(
-                            route.getUpstream(), exchange.getRequest());
+                            group.getUpstream(), exchange.getRequest());
                     OutboundAuth outboundAuth = userAuth.outbound(
                             traceId, exchange.getRequest(), identity);
+                    log.debug("灰度选组 route={} group={} reason={} traceId={}",
+                            route.getRouteNo(), group.getGroupNo(), selection.reason(), traceId);
                     // 响应处理必须在 WebClient 的 exchangeToMono 回调内完成（此时仍持有上游连接），
                     // 所以把 writeUpstreamResponse 作为 handler 传进去
                     return forwarder.forward(route, exchange.getRequest(), traceId, targetUri,
@@ -191,7 +205,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                             upstream -> writeUpstreamResponse(exchange, route, upstream))
                             .onErrorResume(err -> {
                                 UpstreamFailureKind kind = UpstreamFailureKind.classify(err);
-                                outcome.set(new Outcome(route.getRouteNo(), route.getUpstream(),
+                                outcome.set(new Outcome(route.getRouteNo(), group.getUpstream(),
                                         kind.errorCode()));
                                 return fail(exchange, traceId, kind, err);
                             });
@@ -276,8 +290,9 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
      * 这里已经匹配到路由，结果照常进访问日志（命中路由 + 401）。
      */
     private Mono<Void> rejectUserUnauthorized(ServerWebExchange exchange, GatewayRoute route,
-                                              String traceId, AtomicReference<Outcome> outcome) {
-        outcome.set(new Outcome(route.getRouteNo(), route.getUpstream(),
+                                              RouteGroup group, String traceId,
+                                              AtomicReference<Outcome> outcome) {
+        outcome.set(new Outcome(route.getRouteNo(), group.getUpstream(),
                 UpstreamFailureKind.USER_UNAUTHENTICATED.errorCode()));
         return GatewayErrors.write(exchange, objectMapper,
                 UpstreamFailureKind.USER_UNAUTHENTICATED, traceId, null);

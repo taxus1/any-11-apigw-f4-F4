@@ -3,6 +3,7 @@ package com.apigw.infrastructure.store;
 import com.apigw.common.exception.BizException;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
+import com.apigw.domain.route.RouteGroup;
 import com.apigw.domain.route.RuleTypes;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -217,6 +218,8 @@ public class RouteStore {
         public Integer version;
         public List<RuleDto> conditions = new ArrayList<>();
         public List<RuleDto> actions = new ArrayList<>();
+        /** 灰度分组；灰度功能上线前写进 Redis 的旧配置没这个字段，反序列化时按单默认组补。 */
+        public List<GroupDto> groups = new ArrayList<>();
 
         static Dto from(GatewayRoute r) {
             Dto d = new Dto();
@@ -230,6 +233,7 @@ public class RouteStore {
             d.version = r.getVersion();
             d.conditions = r.getConditions().stream().map(RuleDto::from).toList();
             d.actions = r.getActions().stream().map(RuleDto::from).toList();
+            d.groups = r.getGroups().stream().map(GroupDto::from).toList();
             return d;
         }
 
@@ -244,7 +248,35 @@ public class RouteStore {
                     actions == null ? List.of() : actions.stream().map(RuleDto::toDomain).toList());
             r.getConditions().forEach(x -> x.setRuleKind(RuleTypes.KIND_CONDITION));
             r.getActions().forEach(x -> x.setRuleKind(RuleTypes.KIND_ACTION));
+            // 灰度分组：新配置整批还原；灰度上线前的旧 JSON 没这字段，create 时已按
+            // 顶层 upstream 补出权重 100 的默认单组（r.getGroups() 非空），保持老行为不变
+            if (groups != null && !groups.isEmpty()) {
+                r.replaceGroups(groups.stream().map(GroupDto::toDomain).toList());
+            }
             return r;
+        }
+    }
+
+    /** 灰度分组在 Redis 里的形状。 */
+    public static class GroupDto {
+        public String groupNo;
+        public String name;
+        public String upstream;
+        public Integer weight;
+        public String grayTag;
+
+        static GroupDto from(RouteGroup g) {
+            GroupDto d = new GroupDto();
+            d.groupNo = g.getGroupNo();
+            d.name = g.getName();
+            d.upstream = g.getUpstream();
+            d.weight = g.getWeight();
+            d.grayTag = g.getGrayTag();
+            return d;
+        }
+
+        RouteGroup toDomain() {
+            return RouteGroup.create(groupNo, name, upstream, weight, grayTag);
         }
     }
 

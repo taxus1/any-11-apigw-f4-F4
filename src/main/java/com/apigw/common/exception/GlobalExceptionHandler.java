@@ -2,11 +2,14 @@ package com.apigw.common.exception;
 
 import com.apigw.common.Result;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.codec.DecodingException;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.bind.support.WebExchangeBindException;
 import org.springframework.web.server.MissingRequestValueException;
+import org.springframework.web.server.ServerWebInputException;
 import reactor.core.publisher.Mono;
 
 /**
@@ -40,6 +43,20 @@ public class GlobalExceptionHandler {
         String name = e.getReason() != null ? e.getReason() : "必填参数";
         log.warn("缺少请求参数：{}", name);
         return Mono.just(Result.fail("缺少必填参数：" + name));
+    }
+
+    /**
+     * 请求体解析不了（最常见就是权重/版本号这类整数字段填成了字符串或乱填）：
+     * 统一回「请检查字段类型」，别把 Jackson 的内部英文/500 直接甩给配置的人。
+     * 取值范围（负数、超 100、和不为 100）由聚合用更具体的中文报错守，不走这里。
+     * WebFlux 下解码失败包成 {@link ServerWebInputException}（cause 是 DecodingException），
+     * MVC 风格的 {@link HttpMessageNotReadableException} 一并兜住。
+     */
+    @ExceptionHandler({ServerWebInputException.class, HttpMessageNotReadableException.class,
+            DecodingException.class})
+    public Mono<Result<Void>> handleUnreadable(Exception e) {
+        log.warn("请求体解析失败：{}", e.getMessage());
+        return Mono.just(Result.fail("请求体格式不合法，请检查字段类型是否填对（权重等数字字段不能填成非数字）"));
     }
 
     @ExceptionHandler(Exception.class)

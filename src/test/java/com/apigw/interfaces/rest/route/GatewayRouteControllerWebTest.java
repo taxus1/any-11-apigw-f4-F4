@@ -76,6 +76,28 @@ class GatewayRouteControllerWebTest {
         return m;
     }
 
+    private Map<String, Object> group(String groupNo, String upstream, Object weight, String tag) {
+        var m = new java.util.HashMap<String, Object>();
+        m.put("groupNo", groupNo);
+        m.put("upstream", upstream);
+        m.put("weight", weight);
+        if (tag != null) {
+            m.put("grayTag", tag);
+        }
+        return m;
+    }
+
+    private Map<String, Object> bodyWithGroups(String routeNo, List<Map<String, Object>> groups) {
+        var m = new java.util.HashMap<String, Object>();
+        m.put("routeNo", routeNo);
+        m.put("name", "灰度路由");
+        m.put("enabled", 1);
+        m.put("conditions", List.of(rule("PATH_PREFIX", null, "/a/", 1)));
+        m.put("actions", List.of());
+        m.put("groups", groups);
+        return m;
+    }
+
     @Test
     void create_valid_returnsDetailWithVersionZero() {
         when(store.create(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
@@ -275,5 +297,129 @@ class GatewayRouteControllerWebTest {
                 .jsonPath("$.data.total").isEqualTo(1);
         web.get().uri("/api/gateway/routes?keyword=分页").exchange().expectBody()
                 .jsonPath("$.data.total").isEqualTo(6);
+    }
+
+    // ---- 灰度分组的配置校验（HTTP 协议层） ----
+
+    @Test
+    void create_withGroups_validWeights_roundTrips() {
+        when(store.create(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGroups("canary-01", List.of(
+                        group("old", "http://old:8080", 90, null),
+                        group("new", "http://new:8080", 10, "v2"))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.groups.length()").isEqualTo(2)
+                .jsonPath("$.data.groups[0].groupNo").isEqualTo("old")
+                .jsonPath("$.data.groups[0].weight").isEqualTo(90)
+                .jsonPath("$.data.groups[1].grayTag").isEqualTo("v2")
+                // 顶层 upstream 镜像第一组，老链路/SCG 适配不用感知分组
+                .jsonPath("$.data.upstream").isEqualTo("http://old:8080");
+    }
+
+    @Test
+    void create_weightsNotSumming100_rejected_andMessageListsGroups() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGroups("canary-02", List.of(
+                        group("old", "http://old:8080", 90, null),
+                        group("new", "http://new:8080", 5, "v2"))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> {
+                    String msg = v.toString();
+                    org.assertj.core.api.Assertions.assertThat(msg)
+                            .contains("必须正好是 100").contains("现在合计 95")
+                            .contains("[old]=90").contains("[new]=5");
+                });
+    }
+
+    @Test
+    void create_zeroHundredWeightSplit_isAccepted_parkedGroupStays() {
+        when(store.create(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGroups("canary-03", List.of(
+                        group("old", "http://old:8080", 100, null),
+                        group("new", "http://new:8080", 0, "v2"))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.groups[1].weight").isEqualTo(0);
+    }
+
+    @Test
+    void create_negativeOrOverHundredWeight_rejected() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGroups("canary-04", List.of(
+                        group("old", "http://old:8080", 101, null))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("权重必须是 0~100"));
+
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGroups("canary-05", List.of(
+                        group("old", "http://old:8080", -1, null),
+                        group("new", "http://new:8080", 101, null))))
+                .exchange().expectBody()
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("权重必须是 0~100"));
+    }
+
+    @Test
+    void create_nonNumericWeight_rejectedWithTypeHint() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGroups("canary-06", List.of(
+                        group("old", "http://old:8080", "一成", null))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("数字字段不能填成非数字"));
+    }
+
+    @Test
+    void create_badGroupUpstream_rejectedWithGroupNo() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGroups("canary-07", List.of(
+                        group("old", "not-a-url", 100, null))))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("[old]"));
+    }
+
+    @Test
+    void create_duplicateGroupNoOrTag_rejected() {
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGroups("canary-08", List.of(
+                        group("dup", "http://a:8080", 50, null),
+                        group("dup", "http://b:8080", 50, null))))
+                .exchange().expectBody()
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("编号撞了"));
+
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(bodyWithGroups("canary-09", List.of(
+                        group("a", "http://a:8080", 50, "v2"),
+                        group("b", "http://b:8080", 50, "v2"))))
+                .exchange().expectBody()
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("灰度标记撞了"));
+    }
+
+    @Test
+    void create_neitherGroupsNorUpstream_rejected() {
+        var m = new java.util.HashMap<String, Object>();
+        m.put("routeNo", "canary-10");
+        m.put("name", "n");
+        m.put("enabled", 1);
+        m.put("conditions", List.of(rule("PATH_PREFIX", null, "/a/", 1)));
+        m.put("actions", List.of());
+        web.post().uri("/api/gateway/routes").bodyValue(m)
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("上游地址不能为空"));
     }
 }

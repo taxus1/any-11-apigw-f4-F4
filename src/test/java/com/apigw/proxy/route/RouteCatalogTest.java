@@ -118,7 +118,7 @@ class RouteCatalogTest {
                 route("enabled-no-conds", 1, 0)));
         RouteCatalog catalog = new RouteCatalog(store, props);
 
-        List<GatewayRoute> routes = catalog.refresh().block();
+        List<GatewayRoute> routes = catalog.refresh().block().routes();
         assertEquals(1, routes.size());
         assertEquals("enabled-with-conds", routes.get(0).getRouteNo());
     }
